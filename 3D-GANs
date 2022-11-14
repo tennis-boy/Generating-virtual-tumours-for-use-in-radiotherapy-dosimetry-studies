@@ -1,0 +1,245 @@
+import numpy as np
+import torch
+import random
+import os
+import glob
+import torch.nn as nn
+from torch import optim
+import matplotlib.pyplot as plt
+from nibabel.viewers import OrthoSlicer3D
+from torch.nn import functional as F
+from torch import autograd
+from torch.autograd import Variable
+import nibabel as nib
+
+
+class Discriminator(nn.Module):
+    def __init__(self, channel=256, out_class=1, is_dis=True):
+        super(Discriminator, self).__init__()
+        self.is_dis = is_dis
+        self.channel = channel
+        n_class = out_class
+
+        self.conv1 = nn.Conv3d(1, channel // 8, kernel_size=4, stride=2, padding=1)  # input: 1 output: 32
+        self.conv2 = nn.Conv3d(channel // 8, channel // 4, kernel_size=4, stride=2, padding=1)  # in:32 out:64
+        self.bn2 = nn.BatchNorm3d(channel // 4)  # 64
+        self.conv3 = nn.Conv3d(channel // 4, channel // 2, kernel_size=4, stride=2, padding=1)  # in:64 out:128
+        self.bn3 = nn.BatchNorm3d(channel // 2)
+        self.conv4 = nn.Conv3d(channel // 2, channel, kernel_size=4, stride=2, padding=1)  # in:128 out: 256
+        self.bn4 = nn.BatchNorm3d(channel)
+        self.conv5 = nn.Conv3d(channel, n_class, kernel_size=4, stride=1, padding=0)  # in:256 out: 1
+        self.pool = nn.AvgPool3d((13, 13, 13))  # average pooling of the output to 1 dimension
+        self.activation = torch.sigmoid  # activate output to a range (0, 1)
+
+    def forward(self, x, _return_activations=False):
+        h1 = F.leaky_relu(self.conv1(x), negative_slope=0.2)
+        h2 = F.leaky_relu(self.bn2(self.conv2(h1)), negative_slope=0.2)
+        h3 = F.leaky_relu(self.bn3(self.conv3(h2)), negative_slope=0.2)
+        h4 = F.leaky_relu(self.bn4(self.conv4(h3)), negative_slope=0.2)
+        h5 = self.conv5(h4)
+        h6 = self.pool(h5).view(-1)
+        h7 = self.activation(h6)
+        output = h7
+        return output
+
+
+class Generator(nn.Module):
+    def __init__(self, noise: int = 100, channel: int = 256):
+        super(Generator, self).__init__()
+        _c = channel
+
+        self.relu = nn.ReLU()
+        self.noise = noise
+        self.tp_conv1 = nn.ConvTranspose3d(noise, _c * 32, kernel_size=4, stride=1, padding=0, bias=False)
+        self.bn1 = nn.BatchNorm3d(_c * 32)
+
+        self.tp_conv2 = nn.Conv3d(_c * 32, _c * 16, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm3d(_c * 16)
+
+        self.tp_conv3 = nn.Conv3d(_c * 16, _c * 8, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn3 = nn.BatchNorm3d(_c * 8)
+
+        self.tp_conv4 = nn.Conv3d(_c * 8, _c * 4, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn4 = nn.BatchNorm3d(_c * 4)
+
+        self.tp_conv5 = nn.Conv3d(_c * 4, _c * 2, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn5 = nn.BatchNorm3d(_c * 2)
+
+        self.tp_conv6 = nn.Conv3d(_c * 2, _c, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn6 = nn.BatchNorm3d(_c)
+
+        self.tp_conv7 = nn.Conv3d(_c, 1, kernel_size=3, stride=1, padding=1, bias=False)
+
+    def forward(self, noise):
+        noise = noise.view(-1, self.noise, 1, 1, 1)
+        h = self.tp_conv1(noise)
+        h = self.relu(self.bn1(h))
+
+        h = F.interpolate(h, scale_factor=2)
+        h = self.tp_conv2(h)
+        h = self.relu(self.bn2(h))
+
+        h = F.interpolate(h, scale_factor=2)
+        h = self.tp_conv3(h)
+        h = self.relu(self.bn3(h))
+
+        h = F.interpolate(h, scale_factor=2)
+        h = self.tp_conv4(h)
+        h = self.relu(self.bn4(h))
+
+        h = F.interpolate(h, scale_factor=2)
+        h = self.tp_conv5(h)
+        h = self.relu(self.bn5(h))
+
+        h = F.interpolate(h, scale_factor=2)
+        h = self.tp_conv6(h)
+        h = self.relu(self.bn6(h))
+
+        h = F.interpolate(h, scale_factor=2)
+        h = self.tp_conv7(h)
+
+        h = F.tanh(h)
+        return h
+
+
+def data_loader(data_dir, num):
+    """
+    Load data from direction: data_dir is the direction of the current folder. num is the number of files to load.
+    data_dir(Path, int) --> torch.tensors
+    precondition: num < len(dataset)
+    """
+    t1_list = sorted(glob.glob(data_dir))  # get a list of files location
+    Nim = len(t1_list)
+    idx = np.arange(Nim)
+    image = []
+
+    for index in idx[:num]:
+        _filename = t1_list[index]  # training data
+        img = nib.load(_filename)
+        data = img.get_fdata()  # get ndarray from nib file
+        minimum = data.min()
+        maxium = data.max()
+
+        rescaled = (data - minimum) / (maxium - minimum) * 2 - 1.  # Rescaled data to (-1, 1)
+        image.append(rescaled)
+
+    image = torch.FloatTensor([image]).transpose(0, 1)
+    return image
+
+
+def train(epochs, batch_size=5, sample_interval=50):
+    train_sample = 300  # sample size for each epoch
+    learning_rate = 0.0002  # learning rate
+    beta1 = 0.5
+    latent_dim = 1000
+
+    # build models
+    g_mod = Generator()
+    d_mod = Discriminator()
+    if torch.cuda.is_available():
+        g_mod = g_mod.cuda()
+        d_mod = d_mod.cuda()
+
+    # Initialize BCELoss function
+    criterion = nn.BCELoss()
+
+    # choose optimizer
+    g_optim = torch.optim.Adam(g_mod.parameters(), lr=learning_rate, betas=(beta1, 0.999))
+    d_optim = torch.optim.Adam(d_mod.parameters(), lr=learning_rate, betas=(beta1, 0.999))
+
+    # load dataset
+    data_dir = './data/*.nii.gz'
+    X_train = data_loader(data_dir, train_sample)
+
+    # Establish convention for real and fake labels during training
+    real_label = 1.
+    fake_label = 0.
+    # Adversarial ground truths
+    valid = torch.full((batch_size,), real_label)
+    fake = torch.full((batch_size,), fake_label)
+
+    # Lists to keep track of progress
+    G_losses = []
+    D_losses = []
+
+    print("Starting Training Loop...")
+
+    for epoch in range(epochs):
+
+        # ---------------------
+        #  Train Discriminator
+        # ---------------------
+
+        d_mod.zero_grad()  # zero gradient
+        # Select a random batch of images
+        idx = np.random.randint(0, X_train.shape[0], batch_size)
+        imgs = X_train[idx]
+
+        _noise = torch.randn(batch_size, latent_dim, 1, 1, 1)
+        # Generate a batch of new images
+        if torch.cuda.is_available():
+            _noise = _noise.cuda()
+        gen_imgs = g_mod(_noise)
+
+        if torch.cuda.is_available():
+            imgs, gen_imgs, valid, fake = imgs.cuda(), gen_imgs.cuda(), valid.cuda(), fake.cuda()
+
+        d_loss_real = criterion(d_mod(imgs), valid)  # calculate binary cross entropy for real image and true label
+        d_loss_real.backward()
+
+        d_loss_fake = criterion(d_mod(gen_imgs.detach()),
+                                fake)  # calculate binary cross entropy for fake image and false label
+        d_loss_fake.backward()
+
+        d_loss = d_loss_real + d_loss_fake  # Compute error of Discriminator as sum over the fake and the real batches
+        d_optim.step()
+
+        # ---------------------
+        #  Train Generator
+        # ---------------------
+
+        g_mod.zero_grad()  # zero gradient
+        # Train the generator (to have the discriminator label samples as valid)
+        g_loss = criterion(d_mod(gen_imgs), valid)
+        # Calculate gradients for G, update twice in one step
+        g_loss.backward()
+        g_optim.step()
+        g_optim.step()
+
+        # Save Losses for plotting later
+        G_losses.append(g_loss.item())
+        D_losses.append(d_loss.item())
+
+        # Plot the progress
+        print("%d [D loss: %f] [G loss: %f]" % (epoch + 1, d_loss.item(), g_loss.item()))
+
+        # If at save interval => save generated image samples
+        if epoch % sample_interval == 0:
+
+            gen_img = gen_imgs.detach().squeeze()[0].numpy()
+            _affine = np.array([[-2., 0., 0., 90.],
+                                [0., 2., 0., -126.],
+                                [0., 0., 2., -72.],
+                                [0., 0., 0., 1.]])
+
+            fake = nib.Nifti1Image(gen_img, affine=_affine)
+            fake.to_filename('./fake_brain/fake_%d.nii.gz' % epoch)
+            # save model
+            torch.save(g_mod.state_dict(), "./model/g_model.pth")
+            torch.save(d_mod.state_dict(), "./model/d_model.pth")
+
+    fig = plt.figure(figsize=(10, 5))
+    plt.title("Generator and Discriminator Loss During Training")
+    plt.plot(G_losses, label="G")
+    plt.plot(D_losses, label="D")
+    plt.xlabel("iterations")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.show()
+    fig.savefig('./fig/plot.png')
+
+    return
+
+
+if __name__ == "__main__":
+    train(epochs=15000, batch_size=5, sample_interval=1000)
